@@ -2,11 +2,6 @@
 
 use eframe::egui;
 use stand_sync::config::{load_config, Config};
-#[cfg(windows)]
-use stand_sync::credentials::KeyringStore;
-#[cfg(not(windows))]
-use stand_sync::credentials::MemoryStore;
-use stand_sync::credentials::{account_id, Credentials, SecretStore};
 use stand_sync::index::Index;
 use stand_sync::lock::{try_lock, InstanceLock, LockError};
 use stand_sync::logsetup::{init_logging, LogHandles, LogState};
@@ -44,8 +39,11 @@ fn main() {
     if log.is_some() {
         tracing::info!(dir = %workdir.display(), "запуск");
     }
-    let secrets = open_secrets();
-    let startup = prepare(&workdir, secrets.as_ref());
+    let startup = prepare(&workdir);
+    if let (Some(handles), Some(config)) = (&log, &startup.config) {
+        handles.state.remember_secret(&config.access_key);
+        handles.state.remember_secret(&config.secret_key);
+    }
     if let Some(message) = &startup.fatal {
         tracing::error!(error = %message, "запуск остановлен");
     }
@@ -67,11 +65,8 @@ fn main() {
         log_path: workdir.join("logs.txt"),
         _instance: instance,
         log,
-        secrets,
         model: Arc::new(Mutex::new(UiModel::new(startup_stand(&startup)))),
         startup,
-        access_key: String::new(),
-        secret_key: String::new(),
         speed_at: None,
         speed_bytes: 0,
         speed_ema: 0.0,
@@ -99,7 +94,6 @@ fn main() {
 struct Startup {
     fatal: Option<String>,
     config: Option<Config>,
-    has_keys: bool,
 }
 
 fn startup_stand(startup: &Startup) -> String {
@@ -110,14 +104,13 @@ fn startup_stand(startup: &Startup) -> String {
         .unwrap_or_default()
 }
 
-fn prepare(workdir: &PathBuf, secrets: &dyn SecretStore) -> Startup {
+fn prepare(workdir: &PathBuf) -> Startup {
     let config = match load_config(workdir) {
         Ok(config) => config,
         Err(err) => {
             return Startup {
                 fatal: Some(err.to_string()),
                 config: None,
-                has_keys: false,
             };
         }
     };
@@ -125,43 +118,18 @@ fn prepare(workdir: &PathBuf, secrets: &dyn SecretStore) -> Startup {
         return Startup {
             fatal: Some(err),
             config: Some(config),
-            has_keys: false,
         };
     }
     if let Err(err) = Index::open(&Index::path_in(workdir), &config.profile()) {
         return Startup {
             fatal: Some(err.to_string()),
             config: Some(config),
-            has_keys: false,
         };
     }
-    let has_keys = match secrets.load(&account_id(&config.endpoint, &config.bucket, &config.stand))
-    {
-        Ok(Some(_)) => true,
-        Ok(None) => false,
-        Err(err) => {
-            return Startup {
-                fatal: Some(err.to_string()),
-                config: Some(config),
-                has_keys: false,
-            };
-        }
-    };
     Startup {
         fatal: None,
         config: Some(config),
-        has_keys,
     }
-}
-
-#[cfg(windows)]
-fn open_secrets() -> Arc<dyn SecretStore> {
-    Arc::new(KeyringStore)
-}
-
-#[cfg(not(windows))]
-fn open_secrets() -> Arc<dyn SecretStore> {
-    Arc::new(MemoryStore::default())
 }
 
 struct SyncApp {
@@ -171,10 +139,7 @@ struct SyncApp {
     log_path: PathBuf,
     _instance: InstanceLock,
     log: Option<LogHandles>,
-    secrets: Arc<dyn SecretStore>,
     startup: Startup,
-    access_key: String,
-    secret_key: String,
     model: Arc<Mutex<UiModel>>,
     speed_at: Option<Instant>,
     speed_bytes: u64,
@@ -184,20 +149,6 @@ struct SyncApp {
 
 impl eframe::App for SyncApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self
-            .model
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .keys_ready
-        {
-            self.startup.has_keys = true;
-            self.access_key.clear();
-            self.secret_key.clear();
-            self.model
-                .lock()
-                .unwrap_or_else(|err| err.into_inner())
-                .keys_ready = false;
-        }
         let model = self
             .model
             .lock()
@@ -224,12 +175,18 @@ impl eframe::App for SyncApp {
                 self.log_link(ui);
                 return;
             }
-            if !self.startup.has_keys {
-                self.keys_form(ui);
-                self.log_link(ui);
-                return;
-            }
+            ui.label("Ключи читаются из config.toml.");
             let syncing = model.syncing;
+            if ui
+                .add_enabled(
+                    !syncing,
+                    egui::Button::new("Проверить доступ").min_size(egui::vec2(220.0, 32.0)),
+                )
+                .clicked()
+            {
+                self.start_check();
+                ctx.request_repaint();
+            }
             if ui
                 .add_enabled(
                     !syncing,
@@ -238,9 +195,7 @@ impl eframe::App for SyncApp {
                 .clicked()
             {
                 self.start_sync();
-            }
-            if !syncing && ui.link("Сменить ключи").clicked() {
-                self.startup.has_keys = false;
+                ctx.request_repaint();
             }
             self.progress_view(ui, &model);
             if !model.status.is_empty() && model.phase != Phase::Scanning {
@@ -265,39 +220,6 @@ impl eframe::App for SyncApp {
 }
 
 impl SyncApp {
-    fn keys_form(&mut self, ui: &mut egui::Ui) {
-        ui.label("Нет сохранённых ключей для этого стенда.");
-        ui.label("Access key");
-        ui.add(egui::TextEdit::singleline(&mut self.access_key).desired_width(f32::INFINITY));
-        ui.label("Secret key");
-        ui.add(
-            egui::TextEdit::singleline(&mut self.secret_key)
-                .password(true)
-                .desired_width(f32::INFINITY),
-        );
-        let model = self
-            .model
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .clone();
-        let busy = model.syncing;
-        if ui
-            .add_enabled(
-                !busy,
-                egui::Button::new("Проверить доступ").min_size(egui::vec2(220.0, 32.0)),
-            )
-            .clicked()
-        {
-            self.start_check();
-        }
-        if !model.status.is_empty() {
-            ui.label(&model.status);
-        }
-        ui.label(
-            "Ключи хранятся в диспетчере учётных данных Windows и не записываются в config.toml.",
-        );
-    }
-
     fn progress_view(&mut self, ui: &mut egui::Ui, model: &UiModel) {
         if model.phase == Phase::Scanning {
             ui.label("Проверяем изменения…");
@@ -393,49 +315,25 @@ impl SyncApp {
         {
             return;
         }
-        let access = self.access_key.trim().to_string();
-        let secret = self.secret_key.clone();
-        if access.is_empty() || secret.is_empty() {
-            self.set_status("Введите Access key и Secret key.");
-            return;
-        }
         let Some(config) = self.startup.config.clone() else {
             return;
         };
-        if let Some(handles) = &self.log {
-            handles.state.remember_secret(&access);
-            handles.state.remember_secret(&secret);
-        }
+        self.remember_config_secrets(&config);
         self.set_busy(true, "Проверяем доступ…");
         let model = Arc::clone(&self.model);
-        let secrets_account = account_id(&config.endpoint, &config.bucket, &config.stand);
         let prefix = config.prefix();
-        let keys = Credentials {
-            access_key: access,
-            secret_key: secret,
-        };
+        let keys = config.keys();
         let state = self.log.as_ref().map(|handles| Arc::clone(&handles.state));
-        let secrets = Arc::clone(&self.secrets);
         self.rt.spawn(async move {
             let store = match S3Store::new(&config.profile(), &config.region, &keys) {
                 Ok(store) => store,
                 Err(err) => {
-                    finish_check(&model, false, err);
+                    finish_check(&model, err);
                     return;
                 }
             };
             match check_listing(&store, &prefix).await {
-                Ok(()) => {
-                    let saved = save_keys(secrets.as_ref(), &secrets_account, &keys);
-                    match saved {
-                        Ok(()) => finish_check(
-                            &model,
-                            true,
-                            "Доступ к префиксу есть. Ключи сохранены.".into(),
-                        ),
-                        Err(err) => finish_check(&model, false, err),
-                    }
-                }
+                Ok(()) => finish_check(&model, "Доступ к префиксу есть.".into()),
                 Err(err) => {
                     if let Some(state) = &state {
                         state.push_error(&access_failure_message(&err));
@@ -446,7 +344,7 @@ impl SyncApp {
                         request_id = err.request_id().unwrap_or(""),
                         "проверка доступа не прошла"
                     );
-                    finish_check(&model, false, access_failure_message(&err));
+                    finish_check(&model, access_failure_message(&err));
                 }
             }
         });
@@ -461,26 +359,13 @@ impl SyncApp {
         {
             return;
         }
+        tracing::info!("нажата кнопка синхронизации");
         let Some(config) = self.startup.config.clone() else {
+            self.set_status("Нет config.toml, синхронизация не запущена.");
             return;
         };
-        let account = account_id(&config.endpoint, &config.bucket, &config.stand);
-        let keys = match self.secrets.load(&account) {
-            Ok(Some(keys)) => keys,
-            Ok(None) => {
-                self.startup.has_keys = false;
-                self.set_status("Сохранённых ключей больше нет.");
-                return;
-            }
-            Err(err) => {
-                self.set_status(err.to_string());
-                return;
-            }
-        };
-        if let Some(handles) = &self.log {
-            handles.state.remember_secret(&keys.access_key);
-            handles.state.remember_secret(&keys.secret_key);
-        }
+        let keys = config.keys();
+        self.remember_config_secrets(&config);
         self.speed_at = None;
         self.speed_bytes = 0;
         self.speed_ema = 0.0;
@@ -542,20 +427,20 @@ impl SyncApp {
             .unwrap_or_else(|err| err.into_inner())
             .status = status.into();
     }
-}
 
-fn finish_check(model: &Mutex<UiModel>, ok: bool, status: String) {
-    let mut ui = model.lock().unwrap_or_else(|err| err.into_inner());
-    ui.syncing = false;
-    ui.status = status;
-    ui.keys_ready = ok;
-    if ok {
-        ui.phase = Phase::Idle;
+    fn remember_config_secrets(&self, config: &Config) {
+        if let Some(handles) = &self.log {
+            handles.state.remember_secret(&config.access_key);
+            handles.state.remember_secret(&config.secret_key);
+        }
     }
 }
 
-fn save_keys(secrets: &dyn SecretStore, account: &str, keys: &Credentials) -> Result<(), String> {
-    secrets.save(account, keys).map_err(|err| err.to_string())
+fn finish_check(model: &Mutex<UiModel>, status: String) {
+    let mut ui = model.lock().unwrap_or_else(|err| err.into_inner());
+    ui.syncing = false;
+    ui.status = status;
+    ui.phase = Phase::Idle;
 }
 
 fn fmt_wait(duration: Duration) -> String {
