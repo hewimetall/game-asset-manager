@@ -288,6 +288,16 @@ impl Index {
         Ok(())
     }
 
+    pub fn forget(&self, rel: &str) -> Result<(), DbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM files WHERE rel = ?1", params![rel])?;
+        tx.execute("DELETE FROM transfers WHERE rel = ?1", params![rel])?;
+        tx.execute("DELETE FROM parts WHERE rel = ?1", params![rel])?;
+        tx.execute("DELETE FROM pending_files WHERE rel = ?1", params![rel])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn commit_success(&self, file: &FileRow) -> Result<(), DbError> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(

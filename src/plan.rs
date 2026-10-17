@@ -41,6 +41,12 @@ pub enum Action {
     Skip,
     Upload,
     Download,
+    /// Файл удалён на сервере и локальная копия не менялась с прошлой синхронизации.
+    DeleteLocal,
+    /// Файл удалён локально и серверная копия не менялась с прошлой синхронизации.
+    DeleteRemote,
+    /// Файла уже нет ни локально, ни на сервере.
+    Forget,
     Conflict(ConflictReason),
 }
 
@@ -50,10 +56,26 @@ pub fn decide(
     index: Option<&IndexFile>,
 ) -> Action {
     match (local, remote, index) {
-        (None, None, _) => Action::Skip,
-        (Some(_), None, _) => Action::Upload,
-        (None, Some(_), _) => Action::Download,
-        (Some(_), Some(_), None) => Action::Conflict(ConflictReason::NoBaseline),
+        (None, None, None) => Action::Skip,
+        (None, None, Some(_)) => Action::Forget,
+        (Some(local), None, Some(index)) => {
+            if local.sha256 == index.sha256 {
+                Action::DeleteLocal
+            } else {
+                Action::Upload
+            }
+        }
+        (Some(_), None, None) => Action::Upload,
+        (None, Some(remote), Some(index)) => {
+            if normalize_etag(&remote.etag) == normalize_etag(&index.remote_etag) {
+                Action::DeleteRemote
+            } else {
+                Action::Download
+            }
+        }
+        (None, Some(_), None) => Action::Download,
+        // Пары без общей базы отправляются с диска: иначе правка никогда не уходит на сервер.
+        (Some(_), Some(_), None) => Action::Upload,
         (Some(local), Some(remote), Some(index)) => {
             let local_same = local.sha256 == index.sha256;
             let remote_same = normalize_etag(&remote.etag) == normalize_etag(&index.remote_etag);
@@ -82,6 +104,7 @@ pub struct Plan {
     pub skipped: u32,
     pub uploads: u32,
     pub downloads: u32,
+    pub deletes: u32,
     pub conflicts: u32,
     pub bytes: u64,
 }
@@ -102,12 +125,22 @@ pub fn build_plan(
         let index_file = index.get(&rel);
         let action = decide(local_file, remote_file, index_file);
         match &action {
-            Action::Skip => {
+            Action::Skip | Action::Forget => {
                 plan.skipped += 1;
+                if matches!(action, Action::Forget) {
+                    plan.items.push(Planned {
+                        rel,
+                        action,
+                        local: None,
+                        remote: None,
+                        bytes: 0,
+                    });
+                }
                 continue;
             }
             Action::Upload => plan.uploads += 1,
             Action::Download => plan.downloads += 1,
+            Action::DeleteLocal | Action::DeleteRemote => plan.deletes += 1,
             Action::Conflict(_) => plan.conflicts += 1,
         }
         let bytes = match &action {
@@ -173,19 +206,27 @@ mod tests {
         );
         assert_eq!(
             decide(Some(&local("sha")), None, Some(&idx)),
+            Action::DeleteLocal
+        );
+        assert_eq!(
+            decide(Some(&local("edited")), None, Some(&idx)),
             Action::Upload
         );
         assert_eq!(
             decide(None, Some(&remote("etag")), Some(&idx)),
+            Action::DeleteRemote
+        );
+        assert_eq!(
+            decide(None, Some(&remote("etag-2")), Some(&idx)),
             Action::Download
         );
         assert_eq!(decide(Some(&local("sha")), None, None), Action::Upload);
         assert_eq!(decide(None, Some(&remote("etag")), None), Action::Download);
         assert_eq!(
             decide(Some(&local("sha")), Some(&remote("etag")), None),
-            Action::Conflict(ConflictReason::NoBaseline)
+            Action::Upload
         );
-        assert_eq!(decide(None, None, Some(&idx)), Action::Skip);
+        assert_eq!(decide(None, None, Some(&idx)), Action::Forget);
     }
 
     #[test]
@@ -250,12 +291,13 @@ mod tests {
             },
         );
         let plan = build_plan(&local_files, &remote_files, &BTreeMap::new());
-        assert_eq!(plan.uploads, 1);
+        assert_eq!(plan.uploads, 2);
         assert_eq!(plan.downloads, 1);
-        assert_eq!(plan.conflicts, 1);
-        assert_eq!(plan.bytes, 16);
-        assert!(plan.items.iter().any(|item| {
-            item.rel == "b.txt" && item.action == Action::Conflict(ConflictReason::NoBaseline)
-        }));
+        assert_eq!(plan.conflicts, 0);
+        assert_eq!(plan.bytes, 23);
+        assert!(plan
+            .items
+            .iter()
+            .any(|item| item.rel == "b.txt" && item.action == Action::Upload));
     }
 }

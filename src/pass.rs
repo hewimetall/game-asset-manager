@@ -31,6 +31,7 @@ pub struct PassOptions {
 pub struct PassReport {
     pub uploaded: u32,
     pub downloaded: u32,
+    pub removed: u32,
     pub conflicts: u32,
     pub failed: u32,
     pub skipped: u32,
@@ -141,6 +142,9 @@ pub async fn run_pass(opts: PassOptions) -> PassReport {
         let op = match &item.action {
             Action::Upload => "отправить",
             Action::Download => "скачать",
+            Action::DeleteLocal => "удалить локально",
+            Action::DeleteRemote => "удалить на сервере",
+            Action::Forget => "убрать из индекса",
             Action::Conflict(reason) => reason.label(),
             Action::Skip => "пропустить",
         };
@@ -149,7 +153,7 @@ pub async fn run_pass(opts: PassOptions) -> PassReport {
     {
         let mut ui = opts.ui.lock().unwrap_or_else(|err| err.into_inner());
         ui.phase = Phase::Transferring;
-        ui.files_total = plan.uploads + plan.downloads;
+        ui.files_total = plan.uploads + plan.downloads + plan.deletes;
         ui.bytes_total = plan.bytes;
     }
 
@@ -157,6 +161,7 @@ pub async fn run_pass(opts: PassOptions) -> PassReport {
     let mut active: tokio::task::JoinSet<ItemResult> = tokio::task::JoinSet::new();
     let mut uploaded = 0u32;
     let mut downloaded = 0u32;
+    let mut removed = 0u32;
     let mut conflicts = plan.conflicts;
     let mut failed = 0u32;
     let mut forbidden = false;
@@ -181,7 +186,11 @@ pub async fn run_pass(opts: PassOptions) -> PassReport {
                                 reason: reason.label().to_string(),
                             });
                     }
-                    Action::Upload | Action::Download => {
+                    Action::Upload
+                    | Action::Download
+                    | Action::DeleteLocal
+                    | Action::DeleteRemote
+                    | Action::Forget => {
                         let ctx = ctx.clone();
                         active.spawn(async move { run_item(ctx, item).await });
                     }
@@ -195,6 +204,7 @@ pub async fn run_pass(opts: PassOptions) -> PassReport {
         match active.join_next().await {
             Some(Ok(ItemResult::Uploaded)) => uploaded += 1,
             Some(Ok(ItemResult::Downloaded)) => downloaded += 1,
+            Some(Ok(ItemResult::Removed)) => removed += 1,
             Some(Ok(ItemResult::Conflict)) => conflicts += 1,
             Some(Ok(ItemResult::Forbidden)) => {
                 forbidden = true;
@@ -220,7 +230,7 @@ pub async fn run_pass(opts: PassOptions) -> PassReport {
         "Отказ доступа. Очередь и файлы сохранены.".to_string()
     } else if failed > 0 {
         "Завершено с ошибками. Очередь сохранена. См. logs.txt.".to_string()
-    } else if uploaded == 0 && downloaded == 0 && conflicts == 0 {
+    } else if uploaded == 0 && downloaded == 0 && removed == 0 && conflicts == 0 {
         "Изменений нет.".to_string()
     } else if conflicts > 0 {
         "Готово. Конфликты не перезаписаны.".to_string()
@@ -238,6 +248,7 @@ pub async fn run_pass(opts: PassOptions) -> PassReport {
     tracing::info!(
         uploaded,
         downloaded,
+        removed,
         conflicts,
         failed,
         forbidden,
@@ -246,6 +257,7 @@ pub async fn run_pass(opts: PassOptions) -> PassReport {
     PassReport {
         uploaded,
         downloaded,
+        removed,
         conflicts,
         failed,
         skipped: plan.skipped,
@@ -270,6 +282,7 @@ fn finish_error_kind(opts: &PassOptions, message: String, forbidden: bool) -> Pa
     PassReport {
         uploaded: 0,
         downloaded: 0,
+        removed: 0,
         conflicts: 0,
         failed: 1,
         skipped: 0,
@@ -472,12 +485,13 @@ mod tests {
             Call::List { prefix, max_keys } => prefix == "stand-dayna/" && *max_keys == 1000,
             Call::Put { key, .. } => key == "stand-dayna/sounds/hit.wav",
             Call::Get { key } => key == "stand-dayna/i18n/ru.json",
+            Call::Delete { .. } => false,
             _ => false,
         }));
     }
 
     #[tokio::test]
-    async fn conflict_does_not_overwrite_either_side() {
+    async fn folder_edit_replaces_the_remote_copy_without_a_baseline() {
         let dir = crate::testutil::temp_dir("conflict");
         write_rel(&dir, "sprites/queen.png", b"local-queen");
         let store = Arc::new(FakeStore::new("stand-dayna/"));
@@ -487,8 +501,8 @@ mod tests {
             "remote",
         );
         let report = pass(&dir, Arc::clone(&store), 2).await;
-        assert_eq!(report.conflicts, 1);
-        assert_eq!(report.uploaded, 0);
+        assert_eq!(report.conflicts, 0);
+        assert_eq!(report.uploaded, 1, "{:?}", report.error);
         assert_eq!(report.downloaded, 0);
         assert_eq!(
             fs::read(dir.join("sprites/queen.png")).unwrap(),
@@ -496,12 +510,45 @@ mod tests {
         );
         assert_eq!(
             store.object("stand-dayna/sprites/queen.png").unwrap(),
-            b"remote-queen"
+            b"local-queen"
         );
-        assert!(store
-            .calls()
-            .iter()
-            .all(|call| matches!(call, Call::List { .. })));
+    }
+
+    #[tokio::test]
+    async fn deletes_and_edits_propagate_both_ways() {
+        let dir = crate::testutil::temp_dir("both-ways");
+        write_rel(&dir, "keep.txt", b"same");
+        write_rel(&dir, "edit-local.txt", b"v1");
+        write_rel(&dir, "delete-local.txt", b"gone-soon");
+        write_rel(&dir, "edit-remote.txt", b"old");
+        write_rel(&dir, "delete-remote.txt", b"drop-me");
+        let store = Arc::new(FakeStore::new("stand-dayna/"));
+        let first = pass(&dir, Arc::clone(&store), 1).await;
+        assert_eq!(first.uploaded, 5, "{:?}", first.error);
+        assert_eq!(first.failed, 0);
+
+        write_rel(&dir, "edit-local.txt", b"v2");
+        fs::remove_file(dir.join("delete-local.txt")).unwrap();
+        store.insert(
+            "stand-dayna/edit-remote.txt",
+            b"from-server".to_vec(),
+            "etag-2",
+        );
+        store.remove("stand-dayna/delete-remote.txt");
+
+        let second = pass(&dir, Arc::clone(&store), 1).await;
+        assert_eq!(second.failed, 0, "{:?}", second.error);
+        assert_eq!(second.uploaded, 1, "local edit");
+        assert_eq!(second.downloaded, 1, "remote edit");
+        assert_eq!(second.removed, 2, "one local delete and one remote delete");
+        assert_eq!(store.object("stand-dayna/edit-local.txt").unwrap(), b"v2");
+        assert!(store.object("stand-dayna/delete-local.txt").is_none());
+        assert_eq!(
+            fs::read(dir.join("edit-remote.txt")).unwrap(),
+            b"from-server"
+        );
+        assert!(!dir.join("delete-remote.txt").exists());
+        assert!(dir.join("keep.txt").is_file());
     }
 
     #[tokio::test]

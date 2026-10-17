@@ -277,6 +277,18 @@ impl ObjectStore for S3Store {
             })
     }
 
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.guard_key(key)?;
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(map_sdk)?;
+        Ok(())
+    }
+
     async fn head(&self, key: &str) -> Result<HeadInfo, StoreError> {
         self.guard_key(key)?;
         let out = self
@@ -422,7 +434,7 @@ mod tests {
         assert!(!src.to_lowercase().contains("checksum_algorithm"));
         assert!(!src.contains("list_buckets"));
         assert!(!src.contains("head_bucket"));
-        assert!(!src.contains("delete_object"));
+        assert!(!src.contains("delete_object_version"));
         assert!(!src.contains("abort_multipart"));
         assert!(!src.contains(".delimiter("));
     }

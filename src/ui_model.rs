@@ -14,6 +14,7 @@ pub enum Phase {
 pub enum Direction {
     Upload,
     Download,
+    Delete,
 }
 
 impl Direction {
@@ -21,6 +22,7 @@ impl Direction {
         match self {
             Self::Upload => "Отправка",
             Self::Download => "Скачивание",
+            Self::Delete => "Удаление",
         }
     }
 }
