@@ -1,3 +1,4 @@
+use crate::credentials::Credentials;
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
@@ -9,13 +10,28 @@ pub struct Profile {
     pub stand: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Config {
     pub version: u32,
     pub stand: String,
     pub endpoint: String,
     pub region: String,
     pub bucket: String,
+    pub access_key: String,
+    pub secret_key: String,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Config")
+            .field("version", &self.version)
+            .field("stand", &self.stand)
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("bucket", &self.bucket)
+            .finish()
+    }
 }
 
 impl Config {
@@ -30,13 +46,20 @@ impl Config {
     pub fn prefix(&self) -> String {
         prefix_for(&self.stand)
     }
+
+    pub fn keys(&self) -> Credentials {
+        Credentials {
+            access_key: self.access_key.clone(),
+            secret_key: self.secret_key.clone(),
+        }
+    }
 }
 
 pub fn prefix_for(stand: &str) -> String {
     format!("stand-{stand}/")
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     version: u32,
@@ -44,12 +67,14 @@ struct RawConfig {
     s3: RawS3,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawS3 {
     endpoint: String,
     region: String,
     bucket: String,
+    access_key: String,
+    secret_key: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -77,8 +102,16 @@ pub fn load_config(workdir: &Path) -> Result<Config, ConfigError> {
 }
 
 pub fn parse_config(text: &str) -> Result<Config, ConfigError> {
-    let raw: RawConfig =
-        toml::from_str(text).map_err(|err| ConfigError::Invalid(err.to_string()))?;
+    let raw: RawConfig = toml::from_str(text).map_err(|err| {
+        let message = err.to_string();
+        if message.contains("missing field")
+            && (message.contains("access_key") || message.contains("secret_key"))
+        {
+            ConfigError::Invalid("в секции [s3] нужны строки access_key и secret_key".into())
+        } else {
+            ConfigError::Invalid(message)
+        }
+    })?;
     if raw.version != 1 {
         return Err(ConfigError::Invalid(format!(
             "поддерживается только version = 1, в файле {}",
@@ -94,13 +127,27 @@ pub fn parse_config(text: &str) -> Result<Config, ConfigError> {
         ));
     }
     validate_bucket(&raw.s3.bucket).map_err(ConfigError::Invalid)?;
+    let access_key = validate_secret("access_key", &raw.s3.access_key)?;
+    let secret_key = validate_secret("secret_key", &raw.s3.secret_key)?;
     Ok(Config {
         version: raw.version,
         stand: raw.stand,
         endpoint,
         region,
         bucket: raw.s3.bucket,
+        access_key,
+        secret_key,
     })
+}
+
+fn validate_secret(name: &str, raw: &str) -> Result<String, ConfigError> {
+    let value = raw.trim();
+    if value.is_empty() || value.chars().any(char::is_whitespace) {
+        return Err(ConfigError::Invalid(format!(
+            "{name} пустой или содержит пробелы"
+        )));
+    }
+    Ok(value.to_string())
 }
 
 pub fn validate_stand(stand: &str) -> Result<(), String> {
@@ -195,6 +242,27 @@ mod tests {
         assert_eq!(cfg.endpoint, "https://s3.twcstorage.ru");
         assert_eq!(cfg.prefix(), "stand-dayna/");
         assert_eq!(cfg.bucket, "13820aae-0a3c-463d-b672-d25f73eda26a");
+        assert_eq!(cfg.access_key, "AKIA_EXAMPLE_KEY");
+        assert!(!format!("{cfg:?}").contains("secret-example-key"));
+        assert!(!format!("{:?}", cfg.keys()).contains("secret-example-key"));
+    }
+
+    #[test]
+    fn empty_keys_are_a_local_error_and_are_not_echoed() {
+        let text = r#"
+version = 1
+stand = "dayna"
+[s3]
+endpoint = "https://s3.twcstorage.ru"
+region = "ru-1"
+bucket = "bucket"
+access_key = ""
+secret_key = "secret-example-key"
+"#;
+        let err = parse_config(text).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("access_key"));
+        assert!(!message.contains("secret-example-key"));
     }
 
     #[test]
