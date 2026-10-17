@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+.stand-sync/
+.stand-sync.sqlite
+.stand-sync.sqlite-wal
+.stand-sync.sqlite-shm
+.stand-sync.sqlite-journal
+logs.txt
+logs.txt.1
+logs.txt.2
+config.toml

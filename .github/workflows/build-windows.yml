@@ -1,0 +1,40 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: test and build sync.exe
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install NASM
+        uses: ilammy/setup-nasm@v1
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --locked --all-targets
+
+      - name: Build release EXE
+        run: cargo build --locked --release --bin sync
+
+      - name: Upload sync.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-windows
+          path: target/release/sync.exe
+          if-no-files-found: error
