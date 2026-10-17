@@ -64,6 +64,10 @@ pub fn prefix_for(stand: &str) -> String {
 struct RawConfig {
     version: u32,
     stand: String,
+    #[serde(default)]
+    access_key: Option<String>,
+    #[serde(default)]
+    secret_key: Option<String>,
     s3: RawS3,
 }
 
@@ -73,8 +77,10 @@ struct RawS3 {
     endpoint: String,
     region: String,
     bucket: String,
-    access_key: String,
-    secret_key: String,
+    #[serde(default)]
+    access_key: Option<String>,
+    #[serde(default)]
+    secret_key: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -103,13 +109,16 @@ pub fn load_config(workdir: &Path) -> Result<Config, ConfigError> {
 
 pub fn parse_config(text: &str) -> Result<Config, ConfigError> {
     let raw: RawConfig = toml::from_str(text).map_err(|err| {
-        let message = err.to_string();
+        // message() не включает строку файла: в ней может быть ключ.
+        let message = err.message();
         if message.contains("missing field")
             && (message.contains("access_key") || message.contains("secret_key"))
         {
-            ConfigError::Invalid("в секции [s3] нужны строки access_key и secret_key".into())
+            ConfigError::Invalid(
+                "нужны access_key и secret_key: рядом с stand или в секции [s3]".into(),
+            )
         } else {
-            ConfigError::Invalid(message)
+            ConfigError::Invalid(message.to_string())
         }
     })?;
     if raw.version != 1 {
@@ -127,8 +136,8 @@ pub fn parse_config(text: &str) -> Result<Config, ConfigError> {
         ));
     }
     validate_bucket(&raw.s3.bucket).map_err(ConfigError::Invalid)?;
-    let access_key = validate_secret("access_key", &raw.s3.access_key)?;
-    let secret_key = validate_secret("secret_key", &raw.s3.secret_key)?;
+    let access_key = pick_secret("access_key", raw.access_key, raw.s3.access_key)?;
+    let secret_key = pick_secret("secret_key", raw.secret_key, raw.s3.secret_key)?;
     Ok(Config {
         version: raw.version,
         stand: raw.stand,
@@ -138,6 +147,23 @@ pub fn parse_config(text: &str) -> Result<Config, ConfigError> {
         access_key,
         secret_key,
     })
+}
+
+fn pick_secret(
+    name: &str,
+    at_root: Option<String>,
+    in_s3: Option<String>,
+) -> Result<String, ConfigError> {
+    let chosen = [at_root, in_s3]
+        .into_iter()
+        .flatten()
+        .find(|value| !value.trim().is_empty());
+    match chosen {
+        Some(value) => validate_secret(name, &value),
+        None => Err(ConfigError::Invalid(format!(
+            "{name} пустой: напишите его рядом с stand или в секции [s3]"
+        ))),
+    }
 }
 
 fn validate_secret(name: &str, raw: &str) -> Result<String, ConfigError> {
@@ -245,6 +271,54 @@ mod tests {
         assert_eq!(cfg.access_key, "AKIA_EXAMPLE_KEY");
         assert!(!format!("{cfg:?}").contains("secret-example-key"));
         assert!(!format!("{:?}", cfg.keys()).contains("secret-example-key"));
+    }
+
+    #[test]
+    fn keys_at_the_root_are_accepted_and_parse_errors_omit_the_line() {
+        let text = r#"
+version = 1
+stand = "dayna"
+access_key = "AKIA_EXAMPLE_KEY"
+secret_key = "secret-example-key"
+[s3]
+endpoint = "https://s3.twcstorage.ru"
+region = "ru-1"
+bucket = "bucket"
+"#;
+        let cfg = parse_config(text).unwrap();
+        assert_eq!(cfg.access_key, "AKIA_EXAMPLE_KEY");
+        assert_eq!(cfg.secret_key, "secret-example-key");
+
+        let nested = r#"
+version = 1
+stand = "dayna"
+[s3]
+endpoint = "https://s3.twcstorage.ru"
+region = "ru-1"
+bucket = "bucket"
+access_key = "AKIA_EXAMPLE_KEY"
+secret_key = "secret-example-key"
+"#;
+        assert_eq!(
+            parse_config(nested).unwrap().secret_key,
+            "secret-example-key"
+        );
+
+        let broken = r#"
+version = 1
+stand = "dayna"
+access_key = "AKIA_EXAMPLE_KEY"
+secret_key = "secret-example-key"
+extra = "no"
+[s3]
+endpoint = "https://s3.twcstorage.ru"
+region = "ru-1"
+bucket = "bucket"
+"#;
+        let message = parse_config(broken).unwrap_err().to_string();
+        assert!(!message.contains("AKIA_EXAMPLE_KEY"));
+        assert!(!message.contains("secret-example-key"));
+        assert!(message.contains("extra"));
     }
 
     #[test]
