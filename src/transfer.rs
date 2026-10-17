@@ -65,6 +65,7 @@ pub enum TransferError {
 pub enum ItemResult {
     Uploaded,
     Downloaded,
+    Removed,
     Conflict,
     Failed(TransferError),
     Forbidden,
@@ -82,6 +83,15 @@ pub async fn run_item(ctx: Ctx, item: Planned) -> ItemResult {
         crate::plan::Action::Download => download_file(&ctx, &item)
             .await
             .map(|()| ItemResult::Downloaded),
+        crate::plan::Action::DeleteLocal => delete_local(&ctx, &item)
+            .await
+            .map(|()| ItemResult::Removed),
+        crate::plan::Action::DeleteRemote => delete_remote(&ctx, &item)
+            .await
+            .map(|()| ItemResult::Removed),
+        crate::plan::Action::Forget => forget_index(&ctx, &item)
+            .await
+            .map(|()| ItemResult::Removed),
         crate::plan::Action::Conflict(reason) => {
             record_conflict(&ctx, &item.rel, reason);
             return ItemResult::Conflict;
@@ -522,6 +532,59 @@ fn create_snapshot(
     };
     db_call(ctx, |db| db.upsert_transfer(&row))?;
     Ok(row)
+}
+
+pub async fn delete_local(ctx: &Ctx, item: &Planned) -> Result<(), TransferError> {
+    let rel = &item.rel;
+    begin_file(ctx, rel, Direction::Delete, 0, 0);
+    let path = local_target(&ctx.workdir, rel).map_err(TransferError::Message)?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            forget_file(ctx, rel);
+            return Err(TransferError::Message(format!(
+                "не удалось удалить {rel}: {err}"
+            )));
+        }
+    }
+    db_call(ctx, |db| db.forget(rel))?;
+    tracing::info!(rel, "локальный файл удалён, потому что его нет на сервере");
+    end_file(ctx, rel);
+    Ok(())
+}
+
+pub async fn delete_remote(ctx: &Ctx, item: &Planned) -> Result<(), TransferError> {
+    let rel = &item.rel;
+    let remote_key = format!("{}{rel}", ctx.prefix);
+    begin_file(ctx, rel, Direction::Delete, 0, 0);
+    let deleted = retry_meta(ctx, rel, "delete", || {
+        let store = Arc::clone(&ctx.store);
+        let key = remote_key.clone();
+        Box::pin(async move { store.delete(&key).await })
+    })
+    .await;
+    match deleted {
+        Ok(()) => {}
+        Err(TransferError::Store(ref err)) if err.is_not_found() => {}
+        Err(err) => {
+            forget_file(ctx, rel);
+            return Err(err);
+        }
+    }
+    db_call(ctx, |db| db.forget(rel))?;
+    tracing::info!(
+        rel,
+        "объект удалён на сервере, потому что файла нет локально"
+    );
+    end_file(ctx, rel);
+    Ok(())
+}
+
+async fn forget_index(ctx: &Ctx, item: &Planned) -> Result<(), TransferError> {
+    db_call(ctx, |db| db.forget(&item.rel))?;
+    tracing::info!(rel = %item.rel, "файл убран из индекса: его нет ни локально, ни на сервере");
+    Ok(())
 }
 
 pub async fn download_file(ctx: &Ctx, item: &Planned) -> Result<(), TransferError> {

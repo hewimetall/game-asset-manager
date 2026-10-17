@@ -188,6 +188,9 @@ pub enum Call {
     Get {
         key: String,
     },
+    Delete {
+        key: String,
+    },
 }
 
 #[async_trait]
@@ -226,6 +229,7 @@ pub trait ObjectStore: Send + Sync {
         dest: &Path,
         progress: Arc<dyn Fn(u64) + Send + Sync>,
     ) -> Result<Downloaded, StoreError>;
+    async fn delete(&self, key: &str) -> Result<(), StoreError>;
 }
 
 pub async fn check_listing(store: &dyn ObjectStore, prefix: &str) -> Result<(), StoreError> {
@@ -292,6 +296,10 @@ impl FakeStore {
             data_max: AtomicUsize::new(0),
             fail_gets: AtomicUsize::new(0),
         }
+    }
+
+    pub fn remove(&self, key: &str) {
+        self.objects.lock().unwrap().remove(key);
     }
 
     pub fn insert(&self, key: impl Into<String>, bytes: Vec<u8>, etag: impl Into<String>) {
@@ -629,6 +637,16 @@ impl ObjectStore for FakeStore {
                 etag: obj.etag.clone(),
             })
             .ok_or(StoreError::NotFound { request_id: None })
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.guard_key(key)?;
+        self.record(Call::Delete {
+            key: key.to_string(),
+        });
+        self.check_faults()?;
+        self.objects.lock().unwrap().remove(key);
+        Ok(())
     }
 
     async fn get_to(
